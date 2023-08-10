@@ -1,5 +1,71 @@
-template-repository (1.0-1) unstable; urgency=medium
+neatvnc (0.6.0+dfsg-4) unstable; urgency=medium
 
-  * Initial release
+  * debian/rules: Enable verbose build.
+  * debian/rules: Allow build failure in tests for big-endian
+    architectures. (See upstream issue 85)
+  * debian/rules: Echo full test log for verbose debugging.
 
- -- Tsic404 <liuheng@deepin.org>  Sat, 28 Jan 2023 13:46:49 +0800
+ -- Boyuan Yang <byang@debian.org>  Tue, 25 Jul 2023 09:46:04 -0400
+
+neatvnc (0.6.0+dfsg-3) unstable; urgency=medium
+
+  * debian/rules: Enable post-build tests, accidentally missing
+    in last build.
+  * debian/control:
+    + Add missing optional build-dependency: ffmpeg, libgbm.
+    + Also add these binary dependencies for -dev packages.
+
+ -- Boyuan Yang <byang@debian.org>  Tue, 25 Jul 2023 09:34:15 -0400
+
+neatvnc (0.6.0+dfsg-1) unstable; urgency=medium
+
+  * New upstream release.
+  * debian/control: Limit libaml requirement to 0.3+.
+
+ -- Boyuan Yang <byang@debian.org>  Mon, 24 Jul 2023 21:17:42 -0400
+
+neatvnc (0.5.4+dfsg-2~exp1) experimental; urgency=medium
+
+  * debian/rules: Enable post-build tests per Gentoo maintainer's
+    suggestion.
+
+ -- Boyuan Yang <byang@debian.org>  Sat, 18 Mar 2023 21:53:27 -0400
+
+neatvnc (0.5.4+dfsg-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Boyuan Yang <byang@debian.org>  Sat, 17 Sep 2022 13:07:41 -0400
+
+neatvnc (0.5.3+dfsg-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Boyuan Yang <byang@debian.org>  Tue, 30 Aug 2022 16:52:56 -0400
+
+neatvnc (0.5.1+dfsg-2) unstable; urgency=high
+
+  * Update copyright file with missing info. (Closes: #1015155)
+
+ -- Boyuan Yang <byang@debian.org>  Fri, 29 Jul 2022 17:00:55 -0400
+
+neatvnc (0.5.1+dfsg-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Boyuan Yang <byang@debian.org>  Wed, 13 Jul 2022 09:32:05 -0400
+
+neatvnc (0.4.0+dfsg-2) unstable; urgency=medium
+
+  * Source-only upload.
+  * debian/control: Add missing dependency for package libneatvnc-dev:
+    gnutls-dev, libaml-dev, libpixman-1-dev, libturbojpeg0-dev,
+    zlib1g-dev.
+
+ -- Boyuan Yang <byang@debian.org>  Mon, 17 Jan 2022 14:17:42 -0500
+
+neatvnc (0.4.0+dfsg-1) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Boyuan Yang <byang@debian.org>  Sat, 11 Sep 2021 10:11:11 -0400
