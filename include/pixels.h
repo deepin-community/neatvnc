@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 - 2021 Andri Yngvason
+ * Copyright (c) 2019 - 2024 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -22,15 +22,22 @@
 #include <stdbool.h>
 
 struct rfb_pixel_format;
+struct rfb_set_colour_map_entries_msg;
 
-void pixel32_to_cpixel(uint8_t* restrict dst,
+enum format_rating_flags {
+	FORMAT_RATING_NEED_ALPHA = 1 << 0,
+	FORMAT_RATING_PREFER_LINEAR = 1 << 1,
+};
+
+void pixel_to_cpixel(uint8_t* restrict dst,
                        const struct rfb_pixel_format* dst_fmt,
-                       const uint32_t* restrict src,
+                       const uint8_t* restrict src,
                        const struct rfb_pixel_format* src_fmt,
                        size_t bytes_per_cpixel, size_t len);
 
 int rfb_pixfmt_from_fourcc(struct rfb_pixel_format *dst, uint32_t src);
 uint32_t rfb_pixfmt_to_fourcc(const struct rfb_pixel_format* fmt);
+int rfb_pixfmt_depth(const struct rfb_pixel_format *fmt);
 
 int pixel_size_from_fourcc(uint32_t fourcc);
 
@@ -41,3 +48,7 @@ bool extract_alpha_mask(uint8_t* dst, const void* src, uint32_t format,
 
 const char* drm_format_to_string(uint32_t fmt);
 const char* rfb_pixfmt_to_string(const struct rfb_pixel_format* fmt);
+void make_rgb332_pal8_map(struct rfb_set_colour_map_entries_msg* msg);
+
+double rate_pixel_format(uint32_t format, uint64_t modifier,
+		enum format_rating_flags flags, int target_depth);

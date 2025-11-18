@@ -35,11 +35,13 @@
 
 EXPORT
 struct nvnc_fb* nvnc_fb_new(uint16_t width, uint16_t height,
-                            uint32_t fourcc_format, uint16_t stride)
+		uint32_t fourcc_format, uint16_t stride)
 {
 	struct nvnc_fb* fb = calloc(1, sizeof(*fb));
 	if (!fb)
 		return NULL;
+
+	uint32_t bpp = pixel_size_from_fourcc(fourcc_format);
 
 	fb->type = NVNC_FB_SIMPLE;
 	fb->ref = 1;
@@ -49,7 +51,7 @@ struct nvnc_fb* nvnc_fb_new(uint16_t width, uint16_t height,
 	fb->stride = stride;
 	fb->pts = NVNC_NO_PTS;
 
-	size_t size = height * stride * 4; /* Assume 4 byte format for now */
+	size_t size = height * stride * bpp;
 	size_t alignment = MAX(4, sizeof(void*));
 	size_t aligned_size = ALIGN_UP(size, alignment);
 
@@ -64,7 +66,7 @@ struct nvnc_fb* nvnc_fb_new(uint16_t width, uint16_t height,
 
 EXPORT
 struct nvnc_fb* nvnc_fb_from_buffer(void* buffer, uint16_t width, uint16_t height,
-                            uint32_t fourcc_format, int32_t stride)
+		uint32_t fourcc_format, int32_t stride)
 {
 	struct nvnc_fb* fb = calloc(1, sizeof(*fb));
 	if (!fb)
@@ -203,7 +205,7 @@ void nvnc_fb_ref(struct nvnc_fb* fb)
 EXPORT
 void nvnc_fb_unref(struct nvnc_fb* fb)
 {
-	if (--fb->ref == 0)
+	if (fb && --fb->ref == 0)
 		nvnc__fb_free(fb);
 }
 
@@ -233,6 +235,9 @@ void nvnc_fb_hold(struct nvnc_fb* fb)
 
 void nvnc_fb_release(struct nvnc_fb* fb)
 {
+	if (!fb)
+		return;
+
 	if (--fb->hold_count != 0)
 		return;
 

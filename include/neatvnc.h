@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <sys/socket.h>
 
 #define NVNC_NO_PTS UINT64_MAX
 
@@ -50,6 +51,7 @@
 
 struct nvnc;
 struct nvnc_client;
+struct nvnc_desktop_layout;
 struct nvnc_display;
 struct nvnc_fb;
 struct nvnc_fb_pool;
@@ -84,6 +86,12 @@ enum nvnc_transform {
 	NVNC_TRANSFORM_FLIPPED_270 = 7,
 };
 
+enum nvnc_keyboard_led_state {
+	NVNC_KEYBOARD_LED_SCROLL_LOCK = 1 << 0,
+	NVNC_KEYBOARD_LED_NUM_LOCK = 1 << 1,
+	NVNC_KEYBOARD_LED_CAPS_LOCK = 1 << 2,
+};
+
 enum nvnc_log_level {
 	NVNC_LOG_PANIC = 0,
 	NVNC_LOG_ERROR = 1,
@@ -91,6 +99,11 @@ enum nvnc_log_level {
 	NVNC_LOG_INFO = 3,
 	NVNC_LOG_DEBUG = 4,
 	NVNC_LOG_TRACE = 5,
+};
+
+enum nvnc_auth_flags {
+	NVNC_AUTH_REQUIRE_AUTH = 1 << 0,
+	NVNC_AUTH_REQUIRE_ENCRYPTION = 1 << 1,
 };
 
 struct nvnc_log_data {
@@ -117,11 +130,15 @@ typedef struct nvnc_fb* (*nvnc_fb_alloc_fn)(uint16_t width, uint16_t height,
 		uint32_t format, uint16_t stride);
 typedef void (*nvnc_cleanup_fn)(void* userdata);
 typedef void (*nvnc_log_fn)(const struct nvnc_log_data*, const char* message);
+typedef bool (*nvnc_desktop_layout_fn)(
+		struct nvnc_client*, const struct nvnc_desktop_layout*);
 
 extern const char nvnc_version[];
 
 struct nvnc* nvnc_open(const char* addr, uint16_t port);
 struct nvnc* nvnc_open_unix(const char *addr);
+struct nvnc* nvnc_open_websocket(const char* addr, uint16_t port);
+struct nvnc* nvnc_open_from_fd(int fd);
 void nvnc_close(struct nvnc* self);
 
 void nvnc_add_display(struct nvnc*, struct nvnc_display*);
@@ -132,12 +149,16 @@ void* nvnc_get_userdata(const void* self);
 
 struct nvnc* nvnc_client_get_server(const struct nvnc_client* client);
 bool nvnc_client_supports_cursor(const struct nvnc_client* client);
-const char* nvnc_client_get_hostname(const struct nvnc_client* client);
+int nvnc_client_get_address(const struct nvnc_client* client,
+		struct sockaddr* restrict addr, socklen_t* restrict addrlen);
 const char* nvnc_client_get_auth_username(const struct nvnc_client* client);
 
 struct nvnc_client* nvnc_client_first(struct nvnc* self);
 struct nvnc_client* nvnc_client_next(struct nvnc_client* client);
 void nvnc_client_close(struct nvnc_client* client);
+
+void nvnc_client_set_led_state(struct nvnc_client*,
+		enum nvnc_keyboard_led_state);
 
 void nvnc_set_name(struct nvnc* self, const char* name);
 
@@ -148,10 +169,14 @@ void nvnc_set_fb_req_fn(struct nvnc* self, nvnc_fb_req_fn);
 void nvnc_set_new_client_fn(struct nvnc* self, nvnc_client_fn);
 void nvnc_set_client_cleanup_fn(struct nvnc_client* self, nvnc_client_fn fn);
 void nvnc_set_cut_text_fn(struct nvnc*, nvnc_cut_text_fn fn);
+void nvnc_set_desktop_layout_fn(struct nvnc* self, nvnc_desktop_layout_fn);
 
 bool nvnc_has_auth(void);
-int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
-                     const char* cert_path, nvnc_auth_fn, void* userdata);
+int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
+		nvnc_auth_fn, void* userdata);
+int nvnc_set_tls_creds(struct nvnc* self, const char* privkey_path,
+                     const char* cert_path);
+int nvnc_set_rsa_creds(struct nvnc* self, const char* private_key_path);
 
 struct nvnc_fb* nvnc_fb_new(uint16_t width, uint16_t height,
                             uint32_t fourcc_format, uint16_t stride);
@@ -202,12 +227,34 @@ struct nvnc* nvnc_display_get_server(const struct nvnc_display*);
 void nvnc_display_feed_buffer(struct nvnc_display*, struct nvnc_fb*,
 			      struct pixman_region16* damage);
 
+uint16_t nvnc_desktop_layout_get_width(const struct nvnc_desktop_layout*);
+uint16_t nvnc_desktop_layout_get_height(const struct nvnc_desktop_layout*);
+uint8_t nvnc_desktop_layout_get_display_count(const struct nvnc_desktop_layout*);
+uint16_t nvnc_desktop_layout_get_display_x_pos(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+uint16_t nvnc_desktop_layout_get_display_y_pos(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+uint16_t nvnc_desktop_layout_get_display_width(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+uint16_t nvnc_desktop_layout_get_display_height(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+struct nvnc_display* nvnc_desktop_layout_get_display(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+
 void nvnc_send_cut_text(struct nvnc*, const char* text, uint32_t len);
 
 void nvnc_set_cursor(struct nvnc*, struct nvnc_fb*, uint16_t width,
 		     uint16_t height, uint16_t hotspot_x, uint16_t hotspot_y,
 		     bool is_damaged);
 
+void nvnc_default_logger(const struct nvnc_log_data* meta, const char* message);
+
 void nvnc_set_log_fn(nvnc_log_fn);
+void nvnc_set_log_fn_thread_local(nvnc_log_fn fn);
 void nvnc_set_log_level(enum nvnc_log_level);
 void nvnc__log(const struct nvnc_log_data*, const char* fmt, ...);
+
+double nvnc_rate_pixel_format(const struct nvnc* self,
+		enum nvnc_fb_type fb_type, uint32_t format, uint64_t modifier);
+double nvnc_rate_cursor_pixel_format(const struct nvnc* self,
+		enum nvnc_fb_type fb_type, uint32_t format, uint64_t modifier);
