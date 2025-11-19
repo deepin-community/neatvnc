@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 - 2022 Andri Yngvason
+ * Copyright (c) 2019 - 2024 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,23 +16,34 @@
 
 #include "rfb-proto.h"
 #include "pixels.h"
+
 #include <stdlib.h>
 #include <assert.h>
 #include <libdrm/drm_fourcc.h>
+#include <math.h>
 
 #define POPCOUNT(x) __builtin_popcount(x)
 #define UDIV_UP(a, b) (((a) + (b) - 1) / (b))
 #define XSTR(s) STR(s)
 #define STR(s) #s
 
-void pixel32_to_cpixel(uint8_t* restrict dst,
-                       const struct rfb_pixel_format* dst_fmt,
-                       const uint32_t* restrict src,
-                       const struct rfb_pixel_format* src_fmt,
-                       size_t bytes_per_cpixel, size_t len)
+#ifndef fourcc_mod_get_vendor
+#define fourcc_mod_get_vendor(modifier) \
+	(((modifier) >> 56) & 0xff)
+#endif
+
+#ifndef fourcc_mod_is_vendor
+#define fourcc_mod_is_vendor(modifier, vendor) \
+	(fourcc_mod_get_vendor(modifier) == DRM_FORMAT_MOD_VENDOR_## vendor)
+#endif
+
+static void pixel32_to_cpixel(uint8_t* restrict dst,
+		const struct rfb_pixel_format* dst_fmt,
+		const uint32_t* restrict src,
+		const struct rfb_pixel_format* src_fmt,
+		size_t bytes_per_cpixel, size_t len)
 {
 	assert(src_fmt->true_colour_flag);
-	assert(src_fmt->bits_per_pixel == 32);
 	assert(src_fmt->depth <= 32);
 	assert(dst_fmt->true_colour_flag);
 	assert(dst_fmt->bits_per_pixel <= 32);
@@ -152,6 +163,148 @@ void pixel32_to_cpixel(uint8_t* restrict dst,
 #undef CONVERT_PIXELS
 }
 
+void pixel_to_cpixel(uint8_t* restrict dst,
+		const struct rfb_pixel_format* dst_fmt,
+		const uint8_t* restrict src,
+		const struct rfb_pixel_format* src_fmt,
+		size_t bytes_per_cpixel, size_t len)
+{
+	if (src_fmt->bits_per_pixel == 32) {
+		pixel32_to_cpixel(dst, dst_fmt, (uint32_t*)src, src_fmt, bytes_per_cpixel, len);
+		return;
+	}
+
+	assert(src_fmt->true_colour_flag);
+	assert(src_fmt->depth <= 32);
+	assert(dst_fmt->true_colour_flag);
+	assert(dst_fmt->bits_per_pixel <= 32);
+	assert(dst_fmt->depth <= 32);
+	assert(bytes_per_cpixel <= 4 && bytes_per_cpixel >= 1);
+
+	uint32_t src_bpp = src_fmt->bits_per_pixel / 8;
+	uint32_t src_red_shift = src_fmt->red_shift;
+	uint32_t src_green_shift = src_fmt->green_shift;
+	uint32_t src_blue_shift = src_fmt->blue_shift;
+
+	uint32_t dst_red_shift = dst_fmt->red_shift;
+	uint32_t dst_green_shift = dst_fmt->green_shift;
+	uint32_t dst_blue_shift = dst_fmt->blue_shift;
+
+	uint32_t src_red_max = src_fmt->red_max;
+	uint32_t src_green_max = src_fmt->green_max;
+	uint32_t src_blue_max = src_fmt->blue_max;
+
+	uint32_t src_red_bits = POPCOUNT(src_fmt->red_max);
+	uint32_t src_green_bits = POPCOUNT(src_fmt->green_max);
+	uint32_t src_blue_bits = POPCOUNT(src_fmt->blue_max);
+
+	uint32_t dst_red_bits = POPCOUNT(dst_fmt->red_max);
+	uint32_t dst_green_bits = POPCOUNT(dst_fmt->green_max);
+	uint32_t dst_blue_bits = POPCOUNT(dst_fmt->blue_max);
+
+	uint32_t dst_endian_correction;
+
+#define CONVERT_PIXELS(cpx, px)                                                \
+	{                                                                      \
+		uint32_t r, g, b;                                              \
+		r = ((px >> src_red_shift) & src_red_max) << dst_red_bits      \
+		        >> src_red_bits << dst_red_shift;                      \
+		g = ((px >> src_green_shift) & src_green_max) << dst_green_bits\
+		        >> src_green_bits << dst_green_shift;                  \
+		b = ((px >> src_blue_shift) & src_blue_max) << dst_blue_bits   \
+		        >> src_blue_bits << dst_blue_shift;                    \
+		cpx = r | g | b;                                               \
+	}
+
+	switch (bytes_per_cpixel) {
+	case 4:
+		if (dst_fmt->big_endian_flag) {
+			while (len--) {
+				uint32_t cpx, px = 0;
+				memcpy(&px, src, src_bpp);
+				src += src_bpp;
+
+				CONVERT_PIXELS(cpx, px)
+
+				*dst++ = (cpx >> 24) & 0xff;
+				*dst++ = (cpx >> 16) & 0xff;
+				*dst++ = (cpx >> 8) & 0xff;
+				*dst++ = (cpx >> 0) & 0xff;
+			}
+		} else {
+			while (len--) {
+				uint32_t cpx, px = 0;
+				memcpy(&px, src, src_bpp);
+				src += src_bpp;
+
+				CONVERT_PIXELS(cpx, px)
+
+				*dst++ = (cpx >> 0) & 0xff;
+				*dst++ = (cpx >> 8) & 0xff;
+				*dst++ = (cpx >> 16) & 0xff;
+				*dst++ = (cpx >> 24) & 0xff;
+			}
+		}
+		break;
+	case 3:
+		if (dst_fmt->bits_per_pixel == 32 && dst_fmt->depth <= 24) {
+			uint32_t min_dst_shift = dst_red_shift;
+			if (min_dst_shift > dst_green_shift)
+				min_dst_shift = dst_green_shift;
+			if (min_dst_shift > dst_blue_shift)
+				min_dst_shift = dst_blue_shift;
+
+			dst_red_shift -= min_dst_shift;
+			dst_green_shift -= min_dst_shift;
+			dst_blue_shift -= min_dst_shift;
+		}
+
+		dst_endian_correction = dst_fmt->big_endian_flag ? 16 : 0;
+
+		while (len--) {
+			uint32_t cpx, px = 0;
+			memcpy(&px, src, src_bpp);
+			src += src_bpp;
+
+			CONVERT_PIXELS(cpx, px)
+
+			*dst++ = (cpx >> (0 ^ dst_endian_correction)) & 0xff;
+			*dst++ = (cpx >> 8) & 0xff;
+			*dst++ = (cpx >> (16 ^ dst_endian_correction)) & 0xff;
+		}
+		break;
+	case 2:
+		dst_endian_correction = dst_fmt->big_endian_flag ? 8 : 0;
+
+		while (len--) {
+			uint32_t cpx, px = 0;
+			memcpy(&px, src, src_bpp);
+			src += src_bpp;
+
+			CONVERT_PIXELS(cpx, px)
+
+			*dst++ = (cpx >> (0 ^ dst_endian_correction)) & 0xff;
+			*dst++ = (cpx >> (8 ^ dst_endian_correction)) & 0xff;
+		}
+		break;
+	case 1:
+		while (len--) {
+			uint32_t cpx, px = 0;
+			memcpy(&px, src, src_bpp);
+			src += src_bpp;
+
+			CONVERT_PIXELS(cpx, px)
+
+			*dst++ = cpx & 0xff;
+		}
+		break;
+	default:
+		abort();
+	}
+
+#undef CONVERT_PIXELS
+}
+
 /* clang-format off */
 int rfb_pixfmt_from_fourcc(struct rfb_pixel_format *dst, uint32_t src) {
 	switch (src & ~DRM_FORMAT_BIG_ENDIAN) {
@@ -210,6 +363,22 @@ bpp_32_10bit:
 		dst->blue_shift = 16;
 bpp_32:
 		dst->bits_per_pixel = 32;
+		dst->depth = 24;
+		dst->red_max = 0xff;
+		dst->green_max = 0xff;
+		dst->blue_max = 0xff;
+		break;
+	case DRM_FORMAT_BGR888:
+		dst->red_shift = 0;
+		dst->green_shift = 8;
+		dst->blue_shift = 16;
+		goto bpp_24;
+	case DRM_FORMAT_RGB888:
+		dst->red_shift = 16;
+		dst->green_shift = 8;
+		dst->blue_shift = 0;
+bpp_24:
+		dst->bits_per_pixel = 24;
 		dst->depth = 24;
 		dst->red_max = 0xff;
 		dst->green_max = 0xff;
@@ -275,6 +444,9 @@ int pixel_size_from_fourcc(uint32_t fourcc)
 	case DRM_FORMAT_ABGR8888:
 	case DRM_FORMAT_XBGR8888:
 		return 4;
+	case DRM_FORMAT_BGR888:
+	case DRM_FORMAT_RGB888:
+		return 3;
 	case DRM_FORMAT_RGBA4444:
 	case DRM_FORMAT_RGBX4444:
 	case DRM_FORMAT_BGRA4444:
@@ -457,6 +629,8 @@ const char* drm_format_to_string(uint32_t fmt)
 	X(XRGB8888) \
 	X(ABGR8888) \
 	X(XBGR8888) \
+	X(RGB888) \
+	X(BGR888) \
 	X(RGBA4444) \
 	X(RGBX4444) \
 	X(BGRA4444) \
@@ -474,9 +648,6 @@ const char* drm_format_to_string(uint32_t fmt)
 // Not exact, but close enough for debugging
 const char* rfb_pixfmt_to_string(const struct rfb_pixel_format* fmt)
 {
-	if (!(fmt->red_max == fmt->green_max && fmt->red_max == fmt->blue_max))
-		goto failure;
-
 	uint32_t profile = (fmt->red_shift << 16) | (fmt->green_shift << 8)
 		| (fmt->blue_shift);
 
@@ -495,9 +666,160 @@ const char* rfb_pixfmt_to_string(const struct rfb_pixel_format* fmt)
 	CASE(8, 4, 0):   return "XRGB4444";
 	CASE(0, 4, 8):   return "XBGR4444";
 	CASE(11, 5, 0):  return "RGB565";
+	CASE(5, 2, 0):   return "RGB332";
+	CASE(0, 2, 5):   return "RGB332";
+	CASE(4, 2, 0):   return "RGB222";
+	CASE(0, 2, 4):   return "BGR222";
 #undef CASE
 	}
-
-failure:
 	return "UNKNOWN";
+}
+
+void make_rgb332_pal8_map(struct rfb_set_colour_map_entries_msg* msg)
+{
+	msg->type = RFB_SERVER_TO_CLIENT_SET_COLOUR_MAP_ENTRIES;
+	msg->padding = 0;
+	msg->first_colour = htons(0);
+	msg->n_colours = htons(256);
+
+	for (unsigned int i = 0; i < 256; ++i) {
+		msg->colours[i].r = htons(round(65535.0 / 7.0 * ((i >> 5) & 7)));
+		msg->colours[i].g = htons(round(65535.0 / 7.0 * ((i >> 2) & 7)));
+		msg->colours[i].b = htons(round(65535.0 / 3.0 * (i & 3)));
+	}
+}
+
+static int get_format_depth(uint32_t format)
+{
+	struct rfb_pixel_format rfbfmt;
+	if (rfb_pixfmt_from_fourcc(&rfbfmt, format) < 0)
+		return 0;
+	return rfbfmt.depth;
+}
+
+/*
+ *     ^  score
+ *     |
+ * 1.0 +.....,
+ *     |     |\
+ *     |     | \
+ *     |     |  \
+ *     |     |   \
+ *     |    /.    .
+ *     |   / .    .
+ *     |  /  .    .
+ *     | /   .    .
+ *     |/    .    .
+ *     +-----+----+---> depth
+ *            \    `- max_depth
+ *             `- target_depth
+ */
+static double rate_format_by_depth(uint32_t format, int target_depth)
+{
+	int depth = get_format_depth(format);
+	if (depth == 0)
+		return 0;
+
+	const double max_depth = 30;
+
+	if (depth >= target_depth) {
+		return (target_depth + max_depth - depth) / max_depth;
+	}
+
+	return depth / max_depth;
+}
+
+static bool format_has_alpha(uint32_t format)
+{
+	switch (format) {
+	case DRM_FORMAT_RGBA1010102:
+	case DRM_FORMAT_BGRA1010102:
+	case DRM_FORMAT_ARGB2101010:
+	case DRM_FORMAT_ABGR2101010:
+	case DRM_FORMAT_RGBA8888:
+	case DRM_FORMAT_BGRA8888:
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_RGBA4444:
+	case DRM_FORMAT_BGRA4444:
+	case DRM_FORMAT_ARGB4444:
+	case DRM_FORMAT_ABGR4444:
+		return true;
+	}
+	return false;
+}
+
+/* The client does not always report accurate depth.
+ */
+int rfb_pixfmt_depth(const struct rfb_pixel_format *fmt)
+{
+	unsigned int r = fmt->red_max;
+	unsigned int g = fmt->green_max;
+	unsigned int b = fmt->blue_max;
+
+	return POPCOUNT(r) + POPCOUNT(g) + POPCOUNT(b);
+}
+
+// All AMD modifiers except DCC are allowed
+static bool amd_format_modifier_is_allowed(uint64_t modifier)
+{
+	return !AMD_FMT_MOD_GET(DCC, modifier) &&
+		!AMD_FMT_MOD_GET(DCC_RETILE, modifier);
+}
+
+static const uint64_t format_modifier_allow_list[] = {
+	DRM_FORMAT_MOD_LINEAR,
+
+	// Intel:
+	I915_FORMAT_MOD_X_TILED,
+	I915_FORMAT_MOD_Y_TILED,
+	I915_FORMAT_MOD_Yf_TILED,
+	// I915_FORMAT_MOD_4_TILED might work but is untested
+};
+
+static bool format_modifier_is_allowed(uint64_t modifier)
+{
+	if (fourcc_mod_is_vendor(modifier, AMD))
+		return amd_format_modifier_is_allowed(modifier);
+
+	for (size_t i = 0; i < sizeof(format_modifier_allow_list) /
+			sizeof(format_modifier_allow_list[0]); ++i)
+		if (modifier == format_modifier_allow_list[i])
+			return true;
+
+	return false;
+}
+
+double rate_pixel_format(uint32_t format, uint64_t modifier,
+		enum format_rating_flags flags, int target_depth)
+{
+	double depth_rating = rate_format_by_depth(format, target_depth);
+	if (depth_rating == 0)
+		return 0;
+
+	if (!format_modifier_is_allowed(modifier))
+		return 0;
+
+	double linear_rating = modifier == DRM_FORMAT_MOD_LINEAR;
+
+	double alpha_rating;
+	if (flags & FORMAT_RATING_NEED_ALPHA) {
+		alpha_rating = format_has_alpha(format);
+		if (alpha_rating == 0)
+			return 0;
+	} else {
+		alpha_rating = !format_has_alpha(format);
+	}
+
+	const double depth_weight = 100;
+	const double linear_weight = (flags & FORMAT_RATING_PREFER_LINEAR) ? 10 : 0;
+	const double alpha_weight = 1;
+
+	const double total_weight = depth_weight + linear_weight + alpha_weight;
+	if (total_weight == 0)
+		return 0;
+
+	return (depth_weight * depth_rating
+	     + linear_weight * linear_rating
+	     + alpha_weight * alpha_rating) / total_weight;
 }
