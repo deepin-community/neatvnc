@@ -19,8 +19,8 @@
 #include "vec.h"
 #include "fb.h"
 #include "pixels.h"
-#include "enc-util.h"
-#include "encoder.h"
+#include "enc/util.h"
+#include "enc/encoder.h"
 #include "rcbuf.h"
 
 #include <stdlib.h>
@@ -42,7 +42,7 @@ struct raw_encoder_work {
 	struct pixman_region16 damage;
 	int n_rects;
 	uint16_t x_pos, y_pos;
-	struct rcbuf *result;
+	struct encoded_frame *result;
 };
 
 struct encoder_impl encoder_impl_raw;
@@ -54,10 +54,10 @@ static inline struct raw_encoder* raw_encoder(struct encoder* encoder)
 }
 
 static int raw_encode_box(struct raw_encoder_work* ctx, struct vec* dst,
-                          const struct rfb_pixel_format* dst_fmt,
-                          const struct nvnc_fb* fb,
-                          const struct rfb_pixel_format* src_fmt, int x_start,
-                          int y_start, int stride, int width, int height)
+		const struct rfb_pixel_format* dst_fmt,
+		const struct nvnc_fb* fb,
+		const struct rfb_pixel_format* src_fmt, int x_start,
+		int y_start, int stride, int width, int height)
 {
 	uint16_t x_pos = ctx->x_pos;
 	uint16_t y_pos = ctx->y_pos;
@@ -69,7 +69,10 @@ static int raw_encode_box(struct raw_encoder_work* ctx, struct vec* dst,
 	if (rc < 0)
 		return -1;
 
-	uint32_t* b = fb->addr;
+	uint8_t* b = fb->addr;
+	int32_t src_bpp = src_fmt->bits_per_pixel / 8;
+	int32_t xoff = x_start * src_bpp;
+	int32_t src_stride = fb->stride * src_bpp;
 
 	int bpp = dst_fmt->bits_per_pixel / 8;
 
@@ -80,9 +83,9 @@ static int raw_encode_box(struct raw_encoder_work* ctx, struct vec* dst,
 	uint8_t* d = dst->data;
 
 	for (int y = y_start; y < y_start + height; ++y) {
-		pixel32_to_cpixel(d + dst->len, dst_fmt,
-		                  b + x_start + y * stride, src_fmt,
-		                  bpp, width);
+		pixel_to_cpixel(d + dst->len, dst_fmt,
+				b + xoff + y * src_stride, src_fmt,
+				bpp, width);
 		dst->len += width * bpp;
 	}
 
@@ -114,7 +117,7 @@ static int raw_encode_frame(struct raw_encoder_work* ctx, struct vec* dst,
 		int box_height = box[i].y2 - y;
 
 		rc = raw_encode_box(ctx, dst, dst_fmt, src, src_fmt, x, y,
-				    src->stride, box_width, box_height);
+				src->stride, box_width, box_height);
 		if (rc < 0)
 			return -1;
 	}
@@ -126,12 +129,12 @@ static int raw_encode_frame(struct raw_encoder_work* ctx, struct vec* dst,
 static void raw_encoder_do_work(void* obj)
 {
 	struct raw_encoder_work* ctx = aml_get_userdata(obj);
-	int rc;
+	int rc __attribute__((unused));
 
 	struct nvnc_fb* fb = ctx->fb;
 	assert(fb);
 
-	size_t bpp = nvnc_fb_get_pixel_size(fb);
+	size_t bpp = ctx->output_format.bits_per_pixel / 8;
 	size_t n_rects = pixman_region_n_rects(&ctx->damage);
 	if (n_rects > UINT16_MAX)
 		n_rects = 1;
@@ -150,7 +153,13 @@ static void raw_encoder_do_work(void* obj)
 			&ctx->damage);
 	assert(rc == 0);
 
-	ctx->result = rcbuf_new(dst.data, dst.len);
+
+	uint16_t width = nvnc_fb_get_width(ctx->fb);
+	uint16_t height = nvnc_fb_get_height(ctx->fb);
+	uint64_t pts = nvnc_fb_get_pts(ctx->fb);
+
+	ctx->result = encoded_frame_new(dst.data, dst.len, ctx->n_rects,
+			width, height, pts);
 	assert(ctx->result);
 }
 
@@ -161,13 +170,10 @@ static void raw_encoder_on_done(void* obj)
 
 	assert(ctx->result);
 
-	self->encoder.n_rects = ctx->n_rects;
-
 	aml_unref(self->work);
 	self->work = NULL;
 
-	uint64_t pts = nvnc_fb_get_pts(ctx->fb);
-	encoder_finish_frame(&self->encoder, ctx->result, pts);
+	encoder_finish_frame(&self->encoder, ctx->result);
 }
 
 struct encoder* raw_encoder_new(void)
@@ -201,10 +207,12 @@ static void raw_encoder_set_output_format(struct encoder* encoder,
 static void raw_encoder_work_destroy(void* obj)
 {
 	struct raw_encoder_work* ctx = obj;
+	nvnc_fb_release(ctx->fb);
 	nvnc_fb_unref(ctx->fb);
 	pixman_region_fini(&ctx->damage);
 	if (ctx->result)
-		rcbuf_unref(ctx->result);
+		encoded_frame_unref(ctx->result);
+	encoder_unref(&ctx->parent->encoder);
 	free(ctx);
 }
 
@@ -224,6 +232,8 @@ static int raw_encoder_encode(struct encoder* encoder, struct nvnc_fb* fb,
 		return -1;
 	}
 
+	encoder_ref(encoder);
+
 	ctx->parent = self;
 	ctx->fb = fb;
 	memcpy(&ctx->output_format, &self->output_format,
@@ -231,6 +241,7 @@ static int raw_encoder_encode(struct encoder* encoder, struct nvnc_fb* fb,
 	ctx->x_pos = self->encoder.x_pos;
 	ctx->y_pos = self->encoder.y_pos;
 	nvnc_fb_ref(ctx->fb);
+	nvnc_fb_hold(ctx->fb);
 	pixman_region_copy(&ctx->damage, damage);
 
 	int rc = aml_start(aml_get_default(), self->work);
