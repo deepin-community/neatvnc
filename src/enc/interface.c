@@ -13,7 +13,7 @@
  * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
  * PERFORMANCE OF THIS SOFTWARE.
  */
-#include "encoder.h"
+#include "enc/encoder.h"
 #include "config.h"
 
 #include <stdlib.h>
@@ -103,14 +103,6 @@ void encoder_set_quality(struct encoder* self, int value)
 		self->impl->set_quality(self, value);
 }
 
-int encoder_resize(struct encoder* self, uint16_t width, uint16_t height)
-{
-	if (self->impl->resize)
-		return self->impl->resize(self, width, height);
-
-	return 0;
-}
-
 int encoder_encode(struct encoder* self, struct nvnc_fb* fb,
 		struct pixman_region16* damage)
 {
@@ -124,9 +116,8 @@ void encoder_request_key_frame(struct encoder* self)
 		return self->impl->request_key_frame(self);
 }
 
-void encoder_finish_frame(struct encoder* self, struct rcbuf* result,
-		uint64_t pts)
+void encoder_finish_frame(struct encoder* self, struct encoded_frame* result)
 {
 	if (self->on_done)
-		self->on_done(self, result, pts);
+		self->on_done(self, result);
 }

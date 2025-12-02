@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021 - 2022 Andri Yngvason
+ * Copyright (c) 2021 - 2024 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,7 +14,7 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include "h264-encoder.h"
+#include "enc/h264-encoder.h"
 #include "neatvnc.h"
 #include "fb.h"
 #include "sys/queue.h"
@@ -50,16 +50,14 @@ struct fb_queue_entry {
 
 TAILQ_HEAD(fb_queue, fb_queue_entry);
 
-struct h264_encoder {
-	h264_encoder_packet_handler_fn on_packet_ready;
-	void* userdata;
+struct h264_encoder_ffmpeg {
+	struct h264_encoder base;
 
 	uint32_t width;
 	uint32_t height;
 	uint32_t format;
 
 	AVRational timebase;
-	AVRational sample_aspect_ratio;
 	enum AVPixelFormat av_pixel_format;
 
 	/* type: AVHWDeviceContext */
@@ -74,7 +72,6 @@ struct h264_encoder {
 	AVFilterContext* filter_in;
 	AVFilterContext* filter_out;
 
-	bool next_frame_should_be_keyframe;
 	struct fb_queue fb_queue;
 
 	struct aml_work* work;
@@ -84,6 +81,8 @@ struct h264_encoder {
 
 	bool please_destroy;
 };
+
+struct h264_encoder_impl h264_encoder_ffmpeg_impl;
 
 static enum AVPixelFormat drm_to_av_pixel_format(uint32_t format)
 {
@@ -166,7 +165,11 @@ static AVFrame* fb_to_avframe(struct nvnc_fb* fb)
 	frame->buf[0] = desc_ref;
 	frame->data[0] = (void*)desc_ref->data;
 
-	// TODO: Set colorspace?
+	// sRGB:
+	frame->colorspace = AVCOL_SPC_RGB;
+	frame->color_primaries = AVCOL_PRI_BT709;
+	frame->color_range = AVCOL_RANGE_JPEG;
+	frame->color_trc = AVCOL_TRC_IEC61966_2_1;
 
 	return frame;
 }
@@ -197,7 +200,7 @@ static int fb_queue_enqueue(struct fb_queue* queue, struct nvnc_fb* fb)
 	return 0;
 }
 
-static int h264_encoder__init_buffersrc(struct h264_encoder* self)
+static int h264_encoder__init_buffersrc(struct h264_encoder_ffmpeg* self)
 {
 	int rc;
 
@@ -218,9 +221,13 @@ static int h264_encoder__init_buffersrc(struct h264_encoder* self)
 	params->format = AV_PIX_FMT_DRM_PRIME;
 	params->width = self->width;
 	params->height = self->height;
-	params->sample_aspect_ratio = self->sample_aspect_ratio;
+	params->sample_aspect_ratio = (AVRational){1, 1};
 	params->time_base = self->timebase;
 	params->hw_frames_ctx = self->hw_frames_ctx;
+#if LIBAVFILTER_VERSION_INT >= AV_VERSION_INT(9, 16, 100)
+	params->color_space = AVCOL_SPC_RGB;
+	params->color_range = AVCOL_RANGE_JPEG;
+#endif
 
 	rc = av_buffersrc_parameters_set(self->filter_in, params);
 	assert(rc == 0);
@@ -229,7 +236,7 @@ static int h264_encoder__init_buffersrc(struct h264_encoder* self)
 	return 0;
 }
 
-static int h264_encoder__init_filters(struct h264_encoder* self)
+static int h264_encoder__init_filters(struct h264_encoder_ffmpeg* self)
 {
 	int rc;
 
@@ -269,7 +276,9 @@ static int h264_encoder__init_filters(struct h264_encoder* self)
 
 	rc = avfilter_graph_parse(self->filter_graph,
 			"hwmap=mode=direct:derive_device=vaapi"
-			",scale_vaapi=format=nv12:mode=fast",
+			",scale_vaapi=format=nv12:mode=fast"
+			":out_color_matrix=bt709:out_range=limited"
+			":out_color_primaries=bt709:out_color_transfer=bt709",
 			outputs, inputs, NULL);
 	if (rc != 0)
 		goto failure;
@@ -292,7 +301,7 @@ failure:
 	return -1;
 }
 
-static int h264_encoder__init_codec_context(struct h264_encoder* self,
+static int h264_encoder__init_codec_context(struct h264_encoder_ffmpeg* self,
 		const AVCodec* codec, int quality)
 {
 	self->codec_ctx = avcodec_alloc_context3(codec);
@@ -303,7 +312,7 @@ static int h264_encoder__init_codec_context(struct h264_encoder* self,
 	c->width = self->width;
 	c->height = self->height;
 	c->time_base = self->timebase;
-	c->sample_aspect_ratio = self->sample_aspect_ratio;
+	c->sample_aspect_ratio = (AVRational){1, 1};
 	c->pix_fmt = AV_PIX_FMT_VAAPI;
 	c->gop_size = INT32_MAX; /* We'll select key frames manually */
 	c->max_b_frames = 0; /* B-frames are bad for latency */
@@ -314,10 +323,16 @@ static int h264_encoder__init_codec_context(struct h264_encoder* self,
 	 */
 	c->profile = 578;
 
+	// Encode BT.709 into the bitstream:
+	c->colorspace = AVCOL_SPC_BT709;
+	c->color_primaries = AVCOL_PRI_BT709;
+	c->color_range = AVCOL_RANGE_MPEG;
+	c->color_trc = AVCOL_TRC_BT709;
+
 	return 0;
 }
 
-static int h264_encoder__init_hw_frames_context(struct h264_encoder* self)
+static int h264_encoder__init_hw_frames_context(struct h264_encoder_ffmpeg* self)
 {
 	self->hw_frames_ctx = av_hwframe_ctx_alloc(self->hw_device_ctx);
 	if (!self->hw_frames_ctx)
@@ -328,14 +343,14 @@ static int h264_encoder__init_hw_frames_context(struct h264_encoder* self)
 	c->sw_format = drm_to_av_pixel_format(self->format);
 	c->width = self->width;
 	c->height = self->height;
-	
+
 	if (av_hwframe_ctx_init(self->hw_frames_ctx) < 0)
 		av_buffer_unref(&self->hw_frames_ctx);
 
 	return 0;
 }
 
-static int h264_encoder__schedule_work(struct h264_encoder* self)
+static int h264_encoder__schedule_work(struct h264_encoder_ffmpeg* self)
 {
 	if (self->current_fb)
 		return 0;
@@ -346,13 +361,14 @@ static int h264_encoder__schedule_work(struct h264_encoder* self)
 
 	DTRACE_PROBE1(neatvnc, h264_encode_frame_begin, self->current_fb->pts);
 
-	self->current_frame_is_keyframe = self->next_frame_should_be_keyframe;
-	self->next_frame_should_be_keyframe = false;
+	self->current_frame_is_keyframe = self->base.next_frame_should_be_keyframe;
+	self->base.next_frame_should_be_keyframe = false;
 
 	return aml_start(aml_get_default(), self->work);
 }
 
-static int h264_encoder__encode(struct h264_encoder* self, AVFrame* frame_in)
+static int h264_encoder__encode(struct h264_encoder_ffmpeg* self,
+		AVFrame* frame_in)
 {
 	int rc;
 
@@ -401,7 +417,7 @@ get_frame_failure:
 
 static void h264_encoder__do_work(void* handle)
 {
-	struct h264_encoder* self = aml_get_userdata(handle);
+	struct h264_encoder_ffmpeg* self = aml_get_userdata(handle);
 
 	AVFrame* frame = fb_to_avframe(self->current_fb);
 	assert(frame); // TODO
@@ -409,10 +425,18 @@ static void h264_encoder__do_work(void* handle)
 	frame->hw_frames_ctx = av_buffer_ref(self->hw_frames_ctx);
 
 	if (self->current_frame_is_keyframe) {
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
+		frame->flags |= AV_FRAME_FLAG_KEY;
+#else
 		frame->key_frame = 1;
+#endif
 		frame->pict_type = AV_PICTURE_TYPE_I;
 	} else {
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
+		frame->flags &= ~AV_FRAME_FLAG_KEY;
+#else
 		frame->key_frame = 0;
+#endif
 		frame->pict_type = AV_PICTURE_TYPE_P;
 	}
 
@@ -431,7 +455,7 @@ failure:
 
 static void h264_encoder__on_work_done(void* handle)
 {
-	struct h264_encoder* self = aml_get_userdata(handle);
+	struct h264_encoder_ffmpeg* self = aml_get_userdata(handle);
 
 	uint64_t pts = nvnc_fb_get_pts(self->current_fb);
 	nvnc_fb_release(self->current_fb);
@@ -441,8 +465,7 @@ static void h264_encoder__on_work_done(void* handle)
 	DTRACE_PROBE1(neatvnc, h264_encode_frame_end, pts);
 
 	if (self->please_destroy) {
-		vec_destroy(&self->current_packet);
-		h264_encoder_destroy(self);
+		h264_encoder_destroy(&self->base);
 		return;
 	}
 
@@ -451,7 +474,7 @@ static void h264_encoder__on_work_done(void* handle)
 		return;
 	}
 
-	void* userdata = self->userdata;
+	void* userdata = self->base.userdata;
 
 	// Must make a copy of packet because the callback might destroy the
 	// encoder object.
@@ -463,7 +486,7 @@ static void h264_encoder__on_work_done(void* handle)
 	vec_clear(&self->current_packet);
 	h264_encoder__schedule_work(self);
 
-	self->on_packet_ready(packet.data, packet.len, pts, userdata);
+	self->base.on_packet_ready(packet.data, packet.len, pts, userdata);
 	vec_destroy(&packet);
 }
 
@@ -477,7 +500,7 @@ static int find_render_node(char *node, size_t maxlen) {
 		if (!(dev->available_nodes & (1 << DRM_NODE_RENDER)))
 			continue;
 
-		strncpy(node, dev->nodes[DRM_NODE_RENDER], maxlen);
+		strncpy(node, dev->nodes[DRM_NODE_RENDER], maxlen - 1);
 		node[maxlen - 1] = '\0';
 		r = 0;
 		break;
@@ -487,14 +510,16 @@ static int find_render_node(char *node, size_t maxlen) {
 	return r;
 }
 
-struct h264_encoder* h264_encoder_create(uint32_t width, uint32_t height,
-		uint32_t format, int quality)
+static struct h264_encoder* h264_encoder_ffmpeg_create(uint32_t width,
+		uint32_t height, uint32_t format, int quality)
 {
 	int rc;
 
-	struct h264_encoder* self = calloc(1, sizeof(*self));
+	struct h264_encoder_ffmpeg* self = calloc(1, sizeof(*self));
 	if (!self)
 		return NULL;
+
+	self->base.impl = &h264_encoder_ffmpeg_impl;
 
 	if (vec_init(&self->current_packet, 65536) < 0)
 		goto packet_failure;
@@ -513,14 +538,13 @@ struct h264_encoder* h264_encoder_create(uint32_t width, uint32_t height,
 	if (rc != 0)
 		goto hwdevice_ctx_failure;
 
-	self->next_frame_should_be_keyframe = true;
+	self->base.next_frame_should_be_keyframe = true;
 	TAILQ_INIT(&self->fb_queue);
 
 	self->width = width;
 	self->height = height;
 	self->format = format;
 	self->timebase = (AVRational){1, 1000000};
-	self->sample_aspect_ratio = (AVRational){1, 1};
 	self->av_pixel_format = drm_to_av_pixel_format(format);
 	if (self->av_pixel_format == AV_PIX_FMT_NONE)
 		goto pix_fmt_failure;
@@ -539,7 +563,7 @@ struct h264_encoder* h264_encoder_create(uint32_t width, uint32_t height,
 		goto codec_context_failure;
 
 	self->codec_ctx->hw_frames_ctx =
-		av_buffer_ref(self->filter_out->inputs[0]->hw_frames_ctx);
+		av_buffer_ref(av_buffersink_get_hw_frames_ctx(self->filter_out));
 
 	AVDictionary *opts = NULL;
 	av_dict_set_int(&opts, "async_depth", 1, 0);
@@ -550,7 +574,7 @@ struct h264_encoder* h264_encoder_create(uint32_t width, uint32_t height,
 	if (rc != 0)
 		goto avcodec_open_failure;
 
-	return self;
+	return &self->base;
 
 avcodec_open_failure:
 	avcodec_free_context(&self->codec_ctx);
@@ -571,8 +595,10 @@ packet_failure:
 	return NULL;
 }
 
-void h264_encoder_destroy(struct h264_encoder* self)
+static void h264_encoder_ffmpeg_destroy(struct h264_encoder* base)
 {
+	struct h264_encoder_ffmpeg* self = (struct h264_encoder_ffmpeg*)base;
+
 	if (self->current_fb) {
 		self->please_destroy = true;
 		return;
@@ -587,30 +613,16 @@ void h264_encoder_destroy(struct h264_encoder* self)
 	free(self);
 }
 
-void h264_encoder_set_packet_handler_fn(struct h264_encoder* self,
-		h264_encoder_packet_handler_fn value)
+static void h264_encoder_ffmpeg_feed(struct h264_encoder* base,
+		struct nvnc_fb* fb)
 {
-	self->on_packet_ready = value;
-}
-
-void h264_encoder_set_userdata(struct h264_encoder* self, void* value)
-{
-	self->userdata = value;
-}
-
-void h264_encoder_request_keyframe(struct h264_encoder* self)
-{
-	self->next_frame_should_be_keyframe = true;
-}
-
-void h264_encoder_feed(struct h264_encoder* self, struct nvnc_fb* fb)
-{
+	struct h264_encoder_ffmpeg* self = (struct h264_encoder_ffmpeg*)base;
 	assert(fb->type == NVNC_FB_GBM_BO);
 
 	// TODO: Add transform filter
 	assert(fb->transform == NVNC_TRANSFORM_NORMAL);
 
-	int rc = fb_queue_enqueue(&self->fb_queue, fb);
+	int rc __attribute__((unused)) = fb_queue_enqueue(&self->fb_queue, fb);
 	assert(rc == 0); // TODO
 
 	nvnc_fb_hold(fb);
@@ -618,3 +630,9 @@ void h264_encoder_feed(struct h264_encoder* self, struct nvnc_fb* fb)
 	rc = h264_encoder__schedule_work(self);
 	assert(rc == 0); // TODO
 }
+
+struct h264_encoder_impl h264_encoder_ffmpeg_impl = {
+	.create = h264_encoder_ffmpeg_create,
+	.destroy = h264_encoder_ffmpeg_destroy,
+	.feed = h264_encoder_ffmpeg_feed,
+};

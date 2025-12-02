@@ -20,10 +20,10 @@
 #include "pixels.h"
 #include "vec.h"
 #include "config.h"
-#include "enc-util.h"
+#include "enc/util.h"
 #include "fb.h"
 #include "rcbuf.h"
-#include "encoder.h"
+#include "enc/encoder.h"
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -119,11 +119,11 @@ static inline struct tight_encoder* tight_encoder(struct encoder* encoder)
 static int tight_encoder_init_stream(z_stream* zs)
 {
 	int rc = deflateInit2(zs,
-	                      /* compression level: */ 1,
-	                      /*            method: */ Z_DEFLATED,
-	                      /*       window bits: */ 15,
-	                      /*         mem level: */ 9,
-	                      /*          strategy: */ Z_DEFAULT_STRATEGY);
+			/* compression level: */ 1,
+			/*            method: */ Z_DEFLATED,
+			/*       window bits: */ 15,
+			/*         mem level: */ 9,
+			/*          strategy: */ Z_DEFAULT_STRATEGY);
 	return rc == Z_OK ? 0 : -1;
 }
 
@@ -169,6 +169,9 @@ failure:
 static int tight_encoder_resize(struct tight_encoder* self, uint32_t width,
 		uint32_t height)
 {
+	if (self->width == width && self->height == height)
+		return 0;
+
 	self->width = width;
 	self->height = height;
 
@@ -233,8 +236,8 @@ static int tight_apply_damage(struct tight_encoder* self,
 			struct pixman_box16 box = {
 				.x1 = x * TSL,
 				.y1 = y * TSL,
-				.x2 = ((x + 1) * TSL) - 1,
-				.y2 = ((y + 1) * TSL) - 1,
+				.x2 = (x + 1) * TSL,
+				.y2 = (y + 1) * TSL,
 			};
 
 			pixman_region_overlap_t overlap
@@ -261,7 +264,7 @@ static void tight_encode_size(struct vec* dst, size_t size)
 }
 
 static int tight_deflate(struct tight_tile* tile, void* src,
-			 size_t len, z_stream* zs, bool flush)
+		size_t len, z_stream* zs, bool flush)
 {
 	zs->next_in = src;
 	zs->avail_in = len;
@@ -302,13 +305,14 @@ static void tight_encode_tile_basic(struct tight_encoder* self,
 	else
 		memcpy(&cfmt, &self->dfmt, sizeof(cfmt));
 
-	uint32_t* addr = nvnc_fb_get_addr(self->fb);
-	int32_t stride = nvnc_fb_get_stride(self->fb);
-
+	uint8_t* addr = nvnc_fb_get_addr(self->fb);
+	int32_t bpp = self->sfmt.bits_per_pixel / 8;
+	int32_t byte_stride = nvnc_fb_get_stride(self->fb) * bpp;
+	int32_t xoff = x * bpp;
 	// TODO: Limit width and hight to the sides
 	for (uint32_t y = y_start; y < y_start + height; ++y) {
-		void* img = addr + x + y * stride;
-		pixel32_to_cpixel(row, &cfmt, img, &self->sfmt,
+		uint8_t* img = addr + xoff + y * byte_stride;
+		pixel_to_cpixel(row, &cfmt, img, &self->sfmt,
 				bytes_per_cpixel, width);
 
 		// TODO What to do if the buffer fills up?
@@ -335,6 +339,10 @@ static enum TJPF tight_get_jpeg_pixfmt(uint32_t fourcc)
 	case DRM_FORMAT_ABGR8888:
 	case DRM_FORMAT_XBGR8888:
 		return TJPF_RGBX;
+	case DRM_FORMAT_BGR888:
+		return TJPF_RGB;
+	case DRM_FORMAT_RGB888:
+		return TJPF_BGR;
 	}
 
 	return TJPF_UNKNOWN;
@@ -360,14 +368,16 @@ static int tight_encode_tile_jpeg(struct tight_encoder* self,
 	if (!handle)
 		return -1;
 
-	uint32_t* addr = nvnc_fb_get_addr(self->fb);
-	int32_t stride = nvnc_fb_get_stride(self->fb);
-	void* img = (uint32_t*)addr + x + y * stride;
+	uint8_t* addr = nvnc_fb_get_addr(self->fb);
+	int32_t bpp = self->sfmt.bits_per_pixel / 8;
+	int32_t byte_stride = nvnc_fb_get_stride(self->fb) * bpp;
+	int32_t xoff = x * bpp;
+	uint8_t* img = addr + xoff + y * byte_stride;
 
 	enum TJSAMP subsampling = (quality == 9) ? TJSAMP_444 : TJSAMP_420;
 
 	int rc = -1;
-	rc = tjCompress2(handle, img, width, stride * 4, height, tjfmt, &buffer,
+	rc = tjCompress2(handle, img, width, byte_stride, height, tjfmt, &buffer,
 			&size, subsampling, quality, TJFLAG_FASTDCT);
 	if (rc < 0) {
 		nvnc_log(NVNC_LOG_ERROR, "Failed to encode tight JPEG box: %s",
@@ -436,6 +446,7 @@ static void on_tight_zs_work_done(void* obj)
 	struct tight_encoder* self = ctx->encoder;
 
 	if (--self->n_jobs == 0) {
+		nvnc_fb_release(self->fb);
 		nvnc_fb_unref(self->fb);
 		schedule_tight_finish(self);
 	}
@@ -507,15 +518,15 @@ static void on_tight_finished(void* obj)
 {
 	struct tight_encoder* self = aml_get_userdata(obj);
 
-	struct rcbuf* result = rcbuf_new(self->dst.data, self->dst.len);
+	struct encoded_frame* result;
+	result = encoded_frame_new(self->dst.data, self->dst.len, self->n_rects,
+			self->width, self->height, self->pts);
 	assert(result);
 
-	self->encoder.n_rects = self->n_rects;
-
-	encoder_finish_frame(&self->encoder, result, self->pts);
+	encoder_finish_frame(&self->encoder, result);
 
 	self->pts = NVNC_NO_PTS;
-	rcbuf_unref(result);
+	encoded_frame_unref(result);
 	encoder_unref(&self->encoder);
 }
 
@@ -570,20 +581,14 @@ static void tight_encoder_set_quality(struct encoder* encoder, int value)
 	self->quality = value;
 }
 
-static int tight_encoder_resize_wrapper(struct encoder* encoder, uint16_t width,
-		uint16_t height)
-{
-	struct tight_encoder* self = tight_encoder(encoder);
-	return tight_encoder_resize(self, width, height);
-}
-
 static int tight_encoder_encode(struct encoder* encoder, struct nvnc_fb* fb,
 		struct pixman_region16* damage)
 {
 	struct tight_encoder* self = tight_encoder(encoder);
 	int rc;
 
-	self->encoder.n_rects = 0;
+	if (tight_encoder_resize(self, fb->width, fb->height))
+		return -1;
 
 	rc = rfb_pixfmt_from_fourcc(&self->sfmt, nvnc_fb_get_fourcc_format(fb));
 	assert(rc == 0);
@@ -605,8 +610,10 @@ static int tight_encoder_encode(struct encoder* encoder, struct nvnc_fb* fb,
 	assert(self->n_rects > 0);
 
 	nvnc_fb_ref(self->fb);
+	nvnc_fb_hold(self->fb);
 
 	if (tight_schedule_encoding_jobs(self) < 0) {
+		nvnc_fb_release(self->fb);
 		nvnc_fb_unref(self->fb);
 		vec_destroy(&self->dst);
 		return -1;
@@ -619,6 +626,5 @@ struct encoder_impl encoder_impl_tight = {
 	.destroy = tight_encoder_destroy_wrapper,
 	.set_output_format = tight_encoder_set_output_format,
 	.set_quality = tight_encoder_set_quality,
-	.resize = tight_encoder_resize_wrapper,
 	.encode = tight_encoder_encode,
 };

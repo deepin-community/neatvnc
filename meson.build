@@ -1,7 +1,7 @@
 project(
 	'neatvnc',
 	'c',
-	version: '0.6.0',
+	version: '0.9.1',
 	license: 'ISC',
 	default_options: [
 		'c_std=gnu11',
@@ -13,30 +13,33 @@ buildtype = get_option('buildtype')
 host_system = host_machine.system()
 
 c_args = [
-	'-DPROJECT_VERSION="@0@"'.format(meson.project_version()),
 	'-D_GNU_SOURCE',
 	'-fvisibility=hidden',
 	'-DAML_UNSTABLE_API=1',
 
 	'-Wmissing-prototypes',
 	'-Wno-unused-parameter',
+	'-Wno-format-truncation',
 ]
 
 if buildtype != 'debug' and buildtype != 'debugoptimized'
 	c_args += '-DNDEBUG'
 endif
 
+version = '"@0@"'.format(meson.project_version())
 git = find_program('git', native: true, required: false)
 if git.found()
-	git_describe = run_command([git, 'describe', '--tags', '--long'])
-	git_branch = run_command([git, 'rev-parse', '--abbrev-ref', 'HEAD'])
-	if git_describe.returncode() == 0 and git_branch.returncode() == 0
-		c_args += '-DGIT_VERSION="@0@ (@1@)"'.format(
-			git_describe.stdout().strip(),
+	git_commit = run_command([git, 'rev-parse', '--short', 'HEAD'], check: false)
+	git_branch = run_command([git, 'rev-parse', '--abbrev-ref', 'HEAD'], check: false)
+	if git_commit.returncode() == 0 and git_branch.returncode() == 0
+		version = '"v@0@-@1@ (@2@)"'.format(
+			meson.project_version(),
+			git_commit.stdout().strip(),
 			git_branch.stdout().strip(),
 		)
 	endif
 endif
+add_project_arguments('-DPROJECT_VERSION=@0@'.format(version), language: 'c')
 
 libdrm_inc = dependency('libdrm').partial_dependency(compile_args: true)
 
@@ -49,6 +52,9 @@ libm = cc.find_library('m', required: false)
 pixman = dependency('pixman-1')
 libturbojpeg = dependency('libturbojpeg', required: get_option('jpeg'))
 gnutls = dependency('gnutls', required: get_option('tls'))
+nettle = dependency('nettle', required: get_option('nettle'))
+hogweed = dependency('hogweed', required: get_option('nettle'))
+gmp = dependency('gmp', required: get_option('nettle'))
 zlib = dependency('zlib')
 gbm = dependency('gbm', required: get_option('gbm'))
 libdrm = dependency('libdrm', required: get_option('h264'))
@@ -68,26 +74,31 @@ endif
 inc = include_directories('include')
 
 sources = [
+	'src/auth/common.c',
 	'src/server.c',
 	'src/vec.c',
-	'src/zrle.c',
-	'src/raw-encoding.c',
+	'src/enc/zrle.c',
+	'src/enc/raw.c',
 	'src/pixels.c',
 	'src/fb.c',
 	'src/fb_pool.c',
 	'src/rcbuf.c',
-	'src/stream.c',
+	'src/stream/interface.c',
+	'src/stream/common.c',
+	'src/stream/tcp.c',
+	'src/desktop-layout.c',
 	'src/display.c',
-	'src/tight.c',
-	'src/enc-util.c',
+	'src/enc/tight.c',
+	'src/enc/util.c',
 	'src/qnum-to-evdev.c',
 	'src/resampler.c',
 	'src/transform-util.c',
 	'src/damage-refinery.c',
-	'src/murmurhash.c',
-	'src/encoder.c',
+	'src/enc/interface.c',
 	'src/cursor.c',
 	'src/logging.c',
+	'src/base64.c',
+	'src/bandwidth.c',
 ]
 
 dependencies = [
@@ -98,6 +109,8 @@ dependencies = [
 	libdrm_inc,
 ]
 
+enable_websocket = false
+
 config = configuration_data()
 
 if libturbojpeg.found()
@@ -106,8 +119,28 @@ if libturbojpeg.found()
 endif
 
 if gnutls.found()
+	sources += [
+		'src/stream/gnutls.c',
+		'src/auth/vencrypt.c',
+	]
 	dependencies += gnutls
 	config.set('ENABLE_TLS', true)
+endif
+
+if nettle.found() and hogweed.found() and gmp.found()
+	dependencies += [ nettle, hogweed, gmp ]
+	enable_websocket = true
+	config.set('HAVE_CRYPTO', true)
+	sources += [
+		'src/crypto/random.c',
+		'src/crypto/nettle/cipher.c',
+		'src/crypto/nettle/hash.c',
+		'src/crypto/nettle/key.c',
+		'src/crypto/nettle/rsa.c',
+		'src/stream/rsa-aes.c',
+		'src/auth/apple-dh.c',
+		'src/auth/rsa-aes.c',
+	]
 endif
 
 if host_system == 'linux' and get_option('systemtap') and cc.has_header('sys/sdt.h')
@@ -119,11 +152,41 @@ if gbm.found()
 	config.set('HAVE_GBM', true)
 endif
 
-if gbm.found() and libdrm.found() and libavcodec.found() and libavfilter.found() and libavutil.found()
-	sources += [ 'src/h264-encoder.c', 'src/open-h264.c' ]
+have_ffmpeg = gbm.found() and libdrm.found() and libavcodec.found() and libavfilter.found() and libavutil.found()
+have_v4l2 = gbm.found() and libdrm.found() and cc.check_header('linux/videodev2.h')
+
+if have_ffmpeg
+	sources += [ 'src/enc/h264/ffmpeg-impl.c' ]
 	dependencies += [libdrm, libavcodec, libavfilter, libavutil]
-	config.set('ENABLE_OPEN_H264', true)
+	config.set('HAVE_FFMPEG', true)
 	config.set('HAVE_LIBAVUTIL', true)
+endif
+
+if have_v4l2
+	sources += [ 'src/enc/h264/v4l2m2m-impl.c' ]
+	config.set('HAVE_V4L2', true)
+endif
+
+if have_ffmpeg or have_v4l2
+	sources += [ 'src/enc/h264/encoder.c', 'src/enc/h264/open-h264.c' ]
+	config.set('ENABLE_OPEN_H264', true)
+endif
+
+if enable_websocket
+	sources += [
+		'src/stream/ws/handshake.c',
+		'src/stream/ws/framing.c',
+		'src/stream/ws/http.c',
+		'src/stream/ws/ws.c',
+	]
+	config.set('ENABLE_WEBSOCKET', true)
+endif
+
+if get_option('experimental')
+	if buildtype == 'release'
+		warning('Experimental features enabled in release build')
+	endif
+	config.set('ENABLE_EXPERIMENTAL', true)
 endif
 
 configure_file(
